@@ -1,0 +1,4 @@
+interface:
+  display_name: "初回指示（kickoff）"
+  short_description: "社員3名を動かして競合リサーチ・LP文面・レビューを output/ に出す"
+  default_prompt: "$kickoff を実行してください。"

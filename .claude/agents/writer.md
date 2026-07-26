@@ -1,0 +1,1 @@
+../../staff/writer/AGENT.md
