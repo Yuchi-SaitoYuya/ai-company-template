@@ -1,0 +1,12 @@
+{
+  "name": "ai-company-office",
+  "private": true,
+  "version": "1.4.0",
+  "description": "ビルド済み Pixel Agents（パッチ適用版）。会社の社員をドット絵オフィスで見るための実行環境",
+  "dependencies": {
+    "@fastify/cors": "^11.2.0",
+    "@fastify/static": "^10.1.2",
+    "@fastify/websocket": "^11.2.0",
+    "fastify": "^5.8.5"
+  }
+}
