@@ -1,0 +1,201 @@
+diff --git a/core/src/teamProvider.ts b/core/src/teamProvider.ts
+index bd3463f..5c5969b 100644
+--- a/core/src/teamProvider.ts
++++ b/core/src/teamProvider.ts
+@@ -57,6 +57,12 @@ export interface TeamProvider {
+     record: Record<string, unknown>,
+   ): { teamName?: string; agentName?: string } | null;
+ 
++  /** Find the team a session leads, keyed by session id rather than transcript content.
++   *  Needed because a lead's transcript does not necessarily carry the team fields that
++   *  extractTeamMetadataFromRecord looks for -- newer Claude builds keep that mapping only
++   *  in the team store. Returns null when the session leads no team. */
++  findTeamByLeadSessionId(sessionId: string): { teamName: string; agentName?: string } | null;
++
+   /** Get the currently-active member names of a team. Source of truth for team membership.
+    *  Returns the Set of names, or null if the team can't be read (team dissolved / no data).
+    *
+diff --git a/server/src/constants.ts b/server/src/constants.ts
+index 54743a0..efad685 100644
+--- a/server/src/constants.ts
++++ b/server/src/constants.ts
+@@ -68,6 +68,12 @@ export const HOOK_EVENT_BUFFER_MS = 5_000;
+  *  safety net: if SessionStart never arrives (e.g. the CLI crashes mid-transition),
+  *  the agent is cleaned up instead of staying as a zombie with pendingClear forever. */
+ export const SESSION_END_GRACE_MS = 2000;
++/** Retry window for attaching a SubagentStart to its spawning tool. The hook can beat
++ *  the JSONL poll that registers the tool in activeToolNames, so the lookup is retried
++ *  instead of dropped -- otherwise no child character is ever created on Claude builds
++ *  that write subagent activity to per-session subagents/*.jsonl files. */
++export const SUBAGENT_PARENT_RETRY_MS = 500;
++export const SUBAGENT_PARENT_RETRY_LIMIT = 10;
+ export const MAX_HOOK_BODY_SIZE = 65_536; // 64KB
+ 
+ // ── Layout/Config Persistence ──────────────────────────────
+diff --git a/server/src/hookEventHandler.ts b/server/src/hookEventHandler.ts
+index dc47008..32465e1 100644
+--- a/server/src/hookEventHandler.ts
++++ b/server/src/hookEventHandler.ts
+@@ -2,9 +2,14 @@ import * as path from 'path';
+ 
+ import type { AgentEvent, HookProvider } from '../../core/src/provider.js';
+ import type { AgentStateStore } from './agentStateStore.js';
+-import { SESSION_END_GRACE_MS } from './constants.js';
++import {
++  SESSION_END_GRACE_MS,
++  SUBAGENT_PARENT_RETRY_LIMIT,
++  SUBAGENT_PARENT_RETRY_MS,
++} from './constants.js';
+ import type { SessionRouter } from './sessionRouter.js';
+ import { getInlineTeammates, hasInlineTeammates } from './teamUtils.js';
++import { linkTeammates } from './transcriptParser.js';
+ import { cancelPermissionTimer, cancelWaitingTimer } from './timerManager.js';
+ import type { AgentState } from './types.js';
+ 
+@@ -502,6 +507,30 @@ export class HookEventHandler {
+     //      Without this guard, external sessions firing run_in_background=true
+     //      for parallel basic subagents would be mis-routed to teammate discovery.
+     // Mirrors the same gate used by the periodic scanAllTeammateFiles fallback.
++    if (this.provider.team && agent.currentHookIsTeammateSpawn === true && !agent.teamName) {
++      // A lead's transcript may never carry the team fields extractTeamMetadataFromRecord
++      // looks for, in which case condition 2 can only be satisfied from the team store.
++      // Resolving by session id keeps the guard intact: an unrelated session spawning
++      // parallel background subagents still leads no team, so it stays on the basic path.
++      const teamMeta = this.provider.team.findTeamByLeadSessionId(event.session_id);
++      if (teamMeta) {
++        agent.teamName = teamMeta.teamName;
++        agent.agentName = teamMeta.agentName;
++        // Same follow-up the JSONL path performs: without it nothing marks this agent as
++        // the lead, so the office cannot tell the lead apart from its teammates.
++        linkTeammates(agentId, agent, this.agents);
++        if (debug)
++          console.log(
++            `[Pixel Agents] Hook: Agent ${agentId} - team resolved from team store: ${agent.teamName}`,
++          );
++        this.agents.broadcast({
++          type: 'agentTeamInfo',
++          id: agentId,
++          teamName: agent.teamName,
++          agentName: agent.agentName,
++        });
++      }
++    }
+     if (this.provider.team && agent.currentHookIsTeammateSpawn === true && agent.teamName) {
+       if (debug)
+         console.log(
+@@ -514,15 +543,58 @@ export class HookEventHandler {
+     // Basic within-turn subagent path: find parent tool ID from activeToolNames.
+     // Use only the real JSONL-populated id -- no synthetic fallback here, or we'd
+     // double-track parents once JSONL catches up.
++    const parentToolId = this.findSubagentParentToolId(agent);
++    if (parentToolId === undefined) {
++      // The SubagentStart hook can beat the JSONL poll that registers the spawning
++      // tool in activeToolNames, and newer Claude builds keep subagent activity in
++      // per-session subagents/*.jsonl files instead of parentToolUseID progress
++      // records -- so the agent_progress path never catches up on its own. Retry the
++      // lookup for a short while and attach to the real JSONL tool id once it lands,
++      // which keeps the existing JSONL-driven subagentClear working.
++      this.retrySubagentStart(agentId, agentType, 1);
++      return;
++    }
++
++    this.spawnSubagentCharacter(agentId, agent, parentToolId, agentType);
++  }
++
++  /** Find the JSONL-registered tool id of an active subagent-spawning tool. */
++  private findSubagentParentToolId(agent: AgentState): string | undefined {
+     const parentTools = this.getSubagentToolSet();
+-    let parentToolId: string | undefined;
+     for (const [toolId, toolName] of agent.activeToolNames) {
+-      if (parentTools.has(toolName)) {
+-        parentToolId = toolId;
+-        break;
+-      }
++      if (parentTools.has(toolName)) return toolId;
++    }
++    return undefined;
++  }
++
++  /** Re-attempt a deferred subagent spawn until the JSONL poll registers the parent. */
++  private retrySubagentStart(agentId: number, agentType: string, attempt: number): void {
++    if (attempt > SUBAGENT_PARENT_RETRY_LIMIT) {
++      if (debug)
++        console.log(
++          `[Pixel Agents] Hook: Agent ${agentId} - SubagentStart: no parent tool for "${agentType}" after ${SUBAGENT_PARENT_RETRY_LIMIT} retries, giving up`,
++        );
++      return;
+     }
+-    if (!parentToolId) return; // JSONL will handle it via agent_progress tool_use
++    setTimeout(() => {
++      const agent = this.agents.get(agentId);
++      if (!agent) return;
++      const parentToolId = this.findSubagentParentToolId(agent);
++      if (parentToolId === undefined) {
++        this.retrySubagentStart(agentId, agentType, attempt + 1);
++        return;
++      }
++      this.spawnSubagentCharacter(agentId, agent, parentToolId, agentType);
++    }, SUBAGENT_PARENT_RETRY_MS);
++  }
++
++  /** Track and broadcast one child sub-agent character under a parent tool. */
++  private spawnSubagentCharacter(
++    agentId: number,
++    agent: AgentState,
++    parentToolId: string,
++    agentType: string,
++  ): void {
+ 
+     // Create child sub-agent character immediately (same as old behavior).
+     const subToolId = `hook-sub-${agentType}-${Date.now()}`;
+diff --git a/server/src/providers/hook/claude/claudeTeamProvider.ts b/server/src/providers/hook/claude/claudeTeamProvider.ts
+index 101f8f8..ea9c008 100644
+--- a/server/src/providers/hook/claude/claudeTeamProvider.ts
++++ b/server/src/providers/hook/claude/claudeTeamProvider.ts
+@@ -113,6 +113,29 @@ export const claudeTeamProvider: TeamProvider = {
+     };
+   },
+ 
++  findTeamByLeadSessionId(sessionId) {
++    const teamsDir = path.join(os.homedir(), '.claude', 'teams');
++    let entries: string[];
++    try {
++      entries = fs.readdirSync(teamsDir);
++    } catch {
++      return null; // no team store -> no teams
++    }
++    for (const entry of entries) {
++      const configPath = path.join(teamsDir, entry, 'config.json');
++      let data: { name?: unknown; leadSessionId?: unknown };
++      try {
++        data = JSON.parse(fs.readFileSync(configPath, 'utf-8')) as typeof data;
++      } catch {
++        continue; // unreadable / not a team dir
++      }
++      if (data.leadSessionId !== sessionId) continue;
++      // The directory name is the team name on disk; `name` is authoritative when present.
++      return { teamName: typeof data.name === 'string' ? data.name : entry };
++    }
++    return null;
++  },
++
+   getTeamMembers(teamName) {
+     const configPath = path.join(os.homedir(), '.claude', 'teams', teamName, 'config.json');
+     let raw: string;
+diff --git a/server/src/transcriptParser.ts b/server/src/transcriptParser.ts
+index 747841b..e6247fc 100644
+--- a/server/src/transcriptParser.ts
++++ b/server/src/transcriptParser.ts
+@@ -531,7 +531,11 @@ function processProgressRecord(
+  * The lead is the agent with no agentName (or the first one detected in the team).
+  * Teammates get leadAgentId pointing to the lead.
+  */
+-function linkTeammates(_agentId: number, agent: AgentState, agents: AgentStateStore): void {
++export function linkTeammates(
++  _agentId: number,
++  agent: AgentState,
++  agents: AgentStateStore,
++): void {
+   const teamName = agent.teamName;
+   if (!teamName) return;
+ 
